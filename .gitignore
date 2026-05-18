@@ -1,0 +1,15 @@
+# Ignora l'ambiente virtuale
+venv/
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+
+# Ignora i file di dati pesanti
+data/
+*.csv
+*.pkl
+*.pt
+*.gpickle
+
+# Ignora file di sistema
+.DS_Store
