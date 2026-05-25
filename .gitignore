@@ -11,5 +11,13 @@ data/
 *.pt
 *.gpickle
 
+# Ignora le cartelle dei grafi generate dal codice
+3ed_trai_h_graphs/
+3ed_trai_h_graphs_commun/
+3ed_tes_h_graphs/
+3ed_tes_h_graphs_hetero_graphs/
+hetero_graphs_pt/
+
+
 # Ignora file di sistema
 .DS_Store
