@@ -1,0 +1,13 @@
+# Python 3.12 consigliato. ma anche un altro dovrebbe andare bene.
+# Per la GPU installare prima la build PyTorch adatta all'hardware:
+
+torch>=2.9,<3
+torch-geometric>=2.8,<3
+numpy>=1.26,<3
+pandas>=2.2,<4
+pyarrow>=18
+networkx>=3.2,<4
+scikit-learn>=1.5,<2
+matplotlib>=3.8,<4
+tqdm>=4.66,<5
+ipykernel>=6,<8
