@@ -27,3 +27,4 @@ test_hetero_graphs_pt/
 # Ignora file di sistema e output temporanei
 .DS_Store
 *.png
+*.zip
