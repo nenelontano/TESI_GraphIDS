@@ -1,10 +1,11 @@
-# Diagnosi dei batch saltati (loss non finita) del Caso 0 su CIC-ToN-IoT.
-# Solo CPU, nessun addestramento: ricostruisce grafi e fold come nel notebook
+# Diagnosi dei batch saltati (gradienti NaN) del Caso 0 su CIC-ToN-IoT.
+# GPU 1 se libera, altrimenti CPU. A) ogni grafo da solo con backward; B) prima epoca vera: ricostruisce grafi e fold come nel notebook
 # baseline-paper-marco e prova ogni grafo da solo con il modello appena inizializzato.
 # Uso sul server (dalla cartella TESI_GraphIDS):  python diagnosi_ton.py
 # Uso su Kaggle (Internet attivo, CPU):  !python diagnosi_ton.py   -> scarica ToN da solo, come il notebook
 import os, json, hashlib, zipfile, urllib.request
-os.environ["CUDA_VISIBLE_DEVICES"] = ""          # nessuna GPU
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"         # GPU 1, come i notebook (se non c'è, CPU)
 os.environ["OMP_NUM_THREADS"] = os.environ["MKL_NUM_THREADS"] = "8"
 
 import random
@@ -19,10 +20,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import HeteroData
 from torch_geometric.nn import HeteroConv, GCNConv
+from torch_geometric.loader import DataLoader
 from sklearn.model_selection import StratifiedKFold, KFold, train_test_split
 from tqdm import tqdm
 
 torch.set_num_threads(8)
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # ---- stessa configurazione del notebook ----
 SU_KAGGLE = Path("/kaggle/working").is_dir()
@@ -265,106 +268,124 @@ class PaperEdgeClassifier(HeteroEdgeClassifier):
         return check("lin_node", self.lin_node(x))
 
 
-def focal_terms(logits, targets):
+def focal_loss(logits, targets):
     ce = F.cross_entropy(logits, targets, reduction="none")
-    return FOCAL_ALPHA * (1 - torch.exp(-ce)) ** FOCAL_GAMMA * ce
+    return (FOCAL_ALPHA * (1 - torch.exp(-ce)) ** FOCAL_GAMMA * ce).mean()
 
 
-@torch.no_grad()
-def prova_grafo(model, g):
-    trace = []
-    z = model(g, trace)
-    loss, max_logit, max_term = 0.0, 0.0, 0.0
-    for r in RELATIONS:
-        logits = model.edge_classify(z[g[r].edge_index[0]], z[g[r].edge_index[1]])
-        if not trace and not torch.isfinite(logits).all():
-            trace.append("logits")
-        terms = focal_terms(logits, g[r].edge_label)
-        if not trace and not torch.isfinite(terms).all():
-            trace.append("focal_per_arco")
-        loss = loss + terms.mean()
-        max_logit = max(max_logit, float(logits.abs().max()))
-        max_term = max(max_term, float(terms.max()))
-    finita = bool(torch.isfinite(torch.as_tensor(loss)))
-    if not finita and not trace:
-        trace.append("media_loss (overflow della somma)")
-    return finita, (trace[0] if trace else ""), float(loss), max_logit, max_term
+def graph_loss(model, graph):
+    z = model(graph)
+    return sum(focal_loss(model.edge_classify(z[graph[r].edge_index[0]], z[graph[r].edge_index[1]]),
+                          graph[r].edge_label) for r in RELATIONS)
+
+
+def prova_gradienti(model, batch):
+    """Come nel training del server: loss, backward, controllo dei gradienti non finiti."""
+    model.zero_grad(set_to_none=True)
+    loss = graph_loss(model, batch)
+    if not torch.isfinite(loss):
+        return False, "loss non finita", float(loss)
+    loss.backward()
+    bad = [n for n, p in model.named_parameters() if p.grad is not None and not torch.isfinite(p.grad).all()]
+    model.zero_grad(set_to_none=True)
+    return not bad, ",".join(bad), float(loss)
 
 
 def statistiche_grafo(g):
     x = g["ip"].x
-    ea = torch.cat([g[r].edge_attr for r in RELATIONS], dim=1)  # 6 feature, stesso ordine di FEATURES
+    ea = torch.cat([g[r].edge_attr for r in RELATIONS], dim=1)
     src, dst = g[RELATIONS[0]].edge_index
-    row = {"window": g.window, "nodi": int(x.size(0)), "archi": int(src.numel()),
-           "attacchi": int(g[RELATIONS[0]].edge_label.sum()),
-           "max_in_degree": float(x[:, 1].max()), "max_out_degree": float(x[:, 2].max()),
-           "max_community": float(x[:, 0].max()), "self_loop": int((src == dst).sum()),
-           "feature_non_finite_float32": int((~torch.isfinite(ea)).sum())}
-    for i, f in enumerate(FEATURES):
-        row[f"max|{f}|"] = float(ea[:, i].abs().max())
-    return row
+    return {"window": g.window, "nodi": int(x.size(0)), "archi": int(src.numel()),
+            "attacchi": int(g[RELATIONS[0]].edge_label.sum()),
+            "max_in_degree": float(x[:, 1].max()), "max_out_degree": float(x[:, 2].max()),
+            "self_loop": int((src == dst).sum()), "feature_non_finite_float32": int((~torch.isfinite(ea)).sum())}
 
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
-    df = load_flows(prepare_toniot(PERCORSO))
-    famiglie = df.groupby("window")["attack_type"].agg(lambda s: ",".join(sorted(set(s) - {"BENIGN"})))
-    groups = list(df.groupby("window", sort=True))
-    graphs = [build_graph(part) for _, part in tqdm(groups, desc="Grafi ToN")]
-    del groups
-    assert sum(g[RELATIONS[0]].num_edges for g in graphs) == len(df)
-
-    tabella = pd.DataFrame([statistiche_grafo(g) for g in graphs])
-    tabella["famiglie"] = famiglie.reindex(pd.to_datetime(tabella["window"])).values
+    print("Dispositivo:", DEVICE)
+    cache = OUT / "grafi_cache.pt"        # cancellalo alla fine (rm data/diagnosi_ton/grafi_cache.pt)
+    if cache.is_file():
+        graphs, famiglie = torch.load(cache, weights_only=False)
+        print("Grafi letti dalla cache:", len(graphs))
+    else:
+        df = load_flows(prepare_toniot(PERCORSO))
+        famiglie = df.groupby("window")["attack_type"].agg(lambda s: ",".join(sorted(set(s) - {"BENIGN"})))
+        groups = list(df.groupby("window", sort=True))
+        graphs = [build_graph(part) for _, part in tqdm(groups, desc="Grafi ToN")]
+        del groups, df
+        torch.save((graphs, famiglie), cache)
     folds = evaluation_splits(graphs)
+    info = pd.DataFrame([statistiche_grafo(g) for g in graphs])
+    info["famiglie"] = famiglie.reindex(pd.to_datetime(info["window"])).values
     for f, parts in folds.items():
         col = np.empty(len(graphs), dtype=object)
         for name, idx in parts.items():
             col[idx] = name
-        tabella[f"fold{f}"] = col
+        info[f"fold{f}"] = col
 
-    print("\nFeature non finite dopo il cast a float32:", int(tabella.feature_non_finite_float32.sum()))
-
-    riepilogo = []
+    # A) ogni grafo da solo, modello appena inizializzato, con backward
+    righe_a = []
     for f, parts in folds.items():
         stats = fit_phi_stats([graphs[i] for i in parts["train"]])
-        print(f"\nFold {f} | min-max Φ:", {k: [v.tolist() for v in p] for k, p in stats.items()})
         seed_everything(SEED)
         model = PaperEdgeClassifier(**PARAMS)
         model.set_phi_stats(stats)
+        model.to(DEVICE).train()
         with torch.no_grad():
-            model.train(); model(graphs[parts["train"][0]])   # inizializza GCNConv(-1, ...)
-        res = {}
-        for mode in ["train", "eval"]:
-            model.train(mode == "train")
-            for i in tqdm(range(len(graphs)), desc=f"fold {f} ({mode})", leave=False):
-                res.setdefault(i, {}).update(dict(zip(
-                    [f"f{f}_{mode}_finita", f"f{f}_{mode}_dove", f"f{f}_{mode}_loss", f"f{f}_{mode}_max_logit", f"f{f}_{mode}_max_termine"],
-                    prova_grafo(model, graphs[i]))))
-        res = pd.DataFrame.from_dict(res, orient="index").sort_index()
-        tabella = pd.concat([tabella, res], axis=1)
-        cattivi = ~tabella[f"f{f}_train_finita"]
-        nel_train = int((cattivi & (tabella[f"fold{f}"] == "train")).sum())
-        riepilogo.append({"fold": f, "grafi non finiti (train mode, tutti)": int(cattivi.sum()),
-                          "di cui nel train": nel_train, "batch saltati nel run vero": SALTATI_REALI[f],
-                          "non finiti in eval mode": int((~tabella[f"f{f}_eval_finita"]).sum())})
+            model(graphs[parts["train"][0]].to(DEVICE))       # inizializza GCNConv(-1, ...)
+        for i in tqdm(range(len(graphs)), desc=f"A fold {f}", leave=False):
+            ok, dove, loss = prova_gradienti(model, graphs[i].to(DEVICE))
+            if not ok:
+                righe_a.append({"fold": f, "indice": i, "split": info.at[i, f"fold{f}"], "parametri_nan": dove, "loss": loss})
+    a = pd.DataFrame(righe_a, columns=["fold", "indice", "split", "parametri_nan", "loss"])
 
-    tabella.to_csv(OUT / "diagnosi_grafi.csv", index=False)
-    riepilogo = pd.DataFrame(riepilogo)
-    riepilogo.to_csv(OUT / "riepilogo.csv", index=False)
-    print("\n=== RIEPILOGO ===")
-    print(riepilogo.to_string(index=False))
+    # B) prima epoca vera (seed 123, stesso DataLoader del notebook): quali batch vengono saltati
+    righe_b = []
+    for f, parts in folds.items():
+        train = [graphs[i] for i in parts["train"]]
+        stats = fit_phi_stats(train)
+        seed_everything(SEED)
+        model = PaperEdgeClassifier(**PARAMS)
+        model.set_phi_stats(stats)
+        model.to(DEVICE).train()
+        optimizer = None
+        loader = DataLoader(train, batch_size=4, shuffle=True, generator=torch.Generator().manual_seed(SEED))
+        for b, batch in enumerate(tqdm(loader, desc=f"B fold {f}", leave=False)):
+            batch = batch.to(DEVICE)
+            if optimizer is None:
+                with torch.no_grad():
+                    model(batch)
+                optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-3)
+            ok, dove, loss = prova_gradienti(model, batch)
+            if ok:
+                optimizer.zero_grad()
+                graph_loss(model, batch).backward()
+                optimizer.step()
+                continue
+            singoli = [(w, *prova_gradienti(model, next(g for g in train if g.window == w).to(DEVICE))[:2])
+                       for w in batch.window]
+            righe_b.append({"fold": f, "batch": b, "finestre": " | ".join(batch.window), "parametri_nan": dove,
+                            "grafi_cattivi_da_soli": " | ".join(w for w, okg, _ in singoli if not okg)})
+    b = pd.DataFrame(righe_b, columns=["fold", "batch", "finestre", "parametri_nan", "grafi_cattivi_da_soli"])
 
-    colonne_cattivi = [c for c in tabella.columns if c.endswith("_train_finita")]
-    sospetti = tabella[~tabella[colonne_cattivi].all(axis=1)]
-    base = ["window", "nodi", "archi", "attacchi", "famiglie", "max_in_degree", "max_out_degree",
-            "self_loop", "feature_non_finite_float32", *[f"fold{f}" for f in folds],
-            *[f"f{f}_train_dove" for f in folds]]
-    print("\n=== GRAFI CON LOSS NON FINITA ===")
-    print(sospetti[base].to_string(index=False) if len(sospetti) else "nessuno")
-    print("\nPer confronto, i 5 grafi più grandi:")
-    print(tabella.nlargest(5, "archi")[base[:9]].to_string(index=False))
-    sospetti.to_csv(OUT / "grafi_sospetti.csv", index=False)
+    a.to_csv(OUT / "A_grafi_singoli.csv", index=False)
+    b.to_csv(OUT / "B_batch_saltati_epoca1.csv", index=False)
+    print("\n=== A) GRAFI DA SOLI CON GRADIENTI NaN ===")
+    if len(a):
+        conteggio = a[a.split == "train"].groupby("fold").size().reindex(range(1, 6), fill_value=0)
+        print(pd.DataFrame({"nel train": conteggio, "batch saltati nel run vero": pd.Series(SALTATI_REALI)}).to_string())
+        sospetti = info.loc[sorted(set(a.indice))]
+        print(sospetti[["window", "nodi", "archi", "attacchi", "famiglie", "max_in_degree", "max_out_degree",
+                        *[f"fold{f}" for f in folds]]].to_string(index=False))
+        print("parametri con gradiente NaN:", sorted(set(",".join(a.parametri_nan).split(","))))
+        sospetti.to_csv(OUT / "grafi_sospetti.csv", index=False)
+    else:
+        print("nessuno")
+    print("\n=== B) BATCH SALTATI NELLA PRIMA EPOCA ===")
+    print(b.groupby("fold").size().reindex(range(1, 6), fill_value=0).rename("saltati").to_frame()
+          .assign(run_vero=pd.Series(SALTATI_REALI)).to_string())
+    print(b.to_string(index=False) if len(b) else "nessuno")
     print(f"\nFile salvati in {OUT}/")
 
 
